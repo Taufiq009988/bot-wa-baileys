@@ -1,0 +1,26 @@
+[
+  {
+    "categories": [
+      0
+    ],
+    "namaOwner": "Winda",
+    "namaKucing": "Kiki",
+    "noHp": "6281919555420",
+    "isInfectious": true,
+    "idPasien": "OPN-2472",
+    "tanggalWaktu": "12/8/2026, 15.17.12",
+    "treatments": []
+  },
+  {
+    "categories": [
+      0
+    ],
+    "namaOwner": "Fiqur",
+    "namaKucing": "Moci",
+    "noHp": "6281919555420",
+    "isInfectious": false,
+    "idPasien": "OPN-5120",
+    "tanggalWaktu": "12/8/2026, 16.39.22",
+    "treatments": []
+  }
+]

@@ -9,7 +9,61 @@
     "isInfectious": true,
     "idPasien": "OPN-2472",
     "tanggalWaktu": "12/8/2026, 15.17.12",
-    "treatments": []
+    "treatments": [
+      {
+        "modul": "PIP/PUP/Muntah",
+        "subType": "pippup_khusus",
+        "subValue": "Kondisi Khusus",
+        "penjelasanKhusus": "Pip berdarah dan pup pasta",
+        "keterangan": "Kondisi Khusus kiki (kak winda)",
+        "mediaPath": "media\\pippup_1786626031601.jpg",
+        "mediaType": "image",
+        "groupMsgKey": {
+          "remoteJid": "120363411876684007@g.us",
+          "fromMe": true,
+          "id": "3EB0BFC699A13DFD305STARFALLD82"
+        }
+      },
+      {
+        "modul": "Sisa Makanan",
+        "keterangan": "Foto Sisa Makanan",
+        "mediaPath": "media\\sisa_makanan_1786626044830.jpg",
+        "mediaType": "image",
+        "groupMsgKey": {
+          "remoteJid": "120363411876684007@g.us",
+          "fromMe": true,
+          "id": "3EB01AE489EEA8STARFALL9F853BC7"
+        }
+      },
+      {
+        "modul": "Makan",
+        "keterangan": "Makan Sendiri",
+        "mediaPath": "media\\makan_1786626055309.mp4",
+        "mediaType": "video",
+        "groupMsgKey": {
+          "remoteJid": "120363411876684007@g.us",
+          "fromMe": true,
+          "id": "3EB0D2STARFALLF08EB67E013FA4C2"
+        }
+      },
+      {
+        "modul": "Minum",
+        "keterangan": "Minum Normal"
+      },
+      {
+        "modul": "Treatment Obat",
+        "keterangan": "Tidak ada treatment obat"
+      },
+      {
+        "modul": "Injeksi",
+        "keterangan": "Tidak ada injeksi"
+      },
+      {
+        "modul": "Kondisi Pasien",
+        "keterangan": "Aktif"
+      }
+    ],
+    "reportSent": true
   },
   {
     "categories": [
@@ -21,6 +75,7 @@
     "isInfectious": false,
     "idPasien": "OPN-5120",
     "tanggalWaktu": "12/8/2026, 16.39.22",
-    "treatments": []
+    "treatments": [],
+    "reportSent": false
   }
 ]

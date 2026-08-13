@@ -12,20 +12,6 @@ import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import ffmpeg from "fluent-ffmpeg";
 import cron from "node-cron";
 
-
-const express = require('express');
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Endpoint HTTP sederhana
-app.get('/', (req, res) => {
-  res.send('Bot WhatsApp Aktif! 🚀');
-});
-
-app.listen(PORT, () => {
-  console.log(`Server Express berjalan di port ${PORT}`);
-});
-
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
 // =========================================================================
@@ -132,6 +118,7 @@ function resetDailyTreatments() {
     if (Array.isArray(PasienPasienDB)) {
       PasienPasienDB.forEach((Pasien) => {
         Pasien.treatments = [];
+        Pasien.reportSent = false;
       });
       saveData(PasienPasienDB);
       console.log(
@@ -183,6 +170,11 @@ const getButtonText = (patient, subValue, defaultText) => {
     (t) => t.modul === "PIP/PUP/Muntah" && t.subValue === subValue,
   );
   return isSelected ? `✅ ${defaultText}` : defaultText;
+};
+
+// Helper untuk mengecek apakah laporan pasien sudah dikirim
+const isReportSent = (patient) => {
+  return patient && patient.reportSent === true;
 };
 
 // =========================================================================
@@ -861,77 +853,6 @@ const connectToWhatsApp = async () => {
           return;
         }
 
-        if (cleanText === "#Hapus_Pasien") {
-          clearSession(jid);
-          if (PasienPasienDB.length === 0) {
-            await sock.sendMessage(
-              jid,
-              {
-                text: "⚠️ Data Pasien Pasien kosong.",
-                buttons: [{ text: "🏠 Menu Utama", id: "#MENU_UTAMA" }],
-              },
-              { quoted: message },
-            );
-            return;
-          }
-
-          const HapusButtons = PasienPasienDB.map((p, idx) => ({
-            text: `🗑️ ${p.namaKucing} (${p.namaOwner})`,
-            id: `#ASK_Hapus_${idx}`,
-          }));
-          HapusButtons.push({ text: "🏠 Menu Utama", id: "#MENU_UTAMA" });
-
-          await sock.sendMessage(
-            jid,
-            { text: "🗑️ *HAPUS Pasien Pasien*:", buttons: HapusButtons },
-            { quoted: message },
-          );
-          return;
-        }
-
-        if (cleanText.startsWith("#ASK_Hapus_")) {
-          const idx = parseInt(cleanText.replace("#ASK_Hapus_", ""));
-          const patient = PasienPasienDB[idx];
-          if (!patient) return;
-
-          await sock.sendMessage(
-            jid,
-            {
-              text: `❓ Anda yakin ingin menghapus data Pasien untuk *${patient.namaKucing} (${patient.namaOwner})*? Aksi ini tidak dapat dibatalkan.`,
-              buttons: [
-                { text: `✅ Ya, Hapus`, id: `#CONFIRM_Hapus_${idx}` },
-                { text: `❌ Batal`, id: "#Pasien" },
-              ],
-            },
-            { quoted: message },
-          );
-          return;
-        }
-
-        if (cleanText.startsWith("#CONFIRM_Hapus_")) {
-          const idx = parseInt(cleanText.replace("#CONFIRM_Hapus_", ""));
-          const HapusdPatient = PasienPasienDB[idx];
-
-          if (HapusdPatient) {
-            PasienPasienDB.splice(idx, 1);
-            saveData(PasienPasienDB);
-            clearSession(jid);
-
-            await sock.sendMessage(
-              jid,
-              {
-                text: `🗑️ *DATA BERHASIL DIHAPUS!*\n\nData Pasien untuk *${HapusdPatient.namaKucing} (${HapusdPatient.namaOwner})* telah dihapus dari sistem.`,
-                buttons: [
-                  { text: "🗑️ Hapus Pasien Lain", id: "#Hapus_Pasien" },
-                  { text: "🏠 Menu Utama", id: "#MENU_UTAMA" },
-                ],
-              },
-              { quoted: message },
-            );
-          }
-          return;
-        }
-
         // =========================================================================
         // TREATMENT FLOW
         // =========================================================================
@@ -1112,8 +1033,9 @@ const connectToWhatsApp = async () => {
             return;
           }
 
+          // DITAMBAHKAN: Pengecekan isReportSent(p) untuk menambahkan centang pada tombol
           const buttons = filteredList.slice(0, 20).map((p) => ({
-            text: `🐾 ${p.namaKucing} (${p.namaOwner})`,
+            text: `${isReportSent(p) ? "✅ " : "🐾 "}${p.namaKucing} (${p.namaOwner})`,
             id: `#SEND_OWNER_${p.originalIndex}`,
           }));
           buttons.push({ text: "🔙 Opsi Lain", id: "#KIRIM_OWNER" });
@@ -1206,8 +1128,14 @@ const connectToWhatsApp = async () => {
             if (treatment.mediaPath && fs.existsSync(treatment.mediaPath)) {
               let caption = "";
               if (treatment.modul === "PIP/PUP/Muntah") {
-                caption =
-                  `${patient.namaKucing} ${treatment.subValue || ""}`.trim();
+                if (treatment.subType === "pippup_khusus") {
+                  // Utamakan penjelasan khusus dari user
+                  caption =
+                    `${patient.namaKucing} ${treatment.penjelasanKhusus || "kondisi khusus"}`.trim();
+                } else {
+                  caption =
+                    `${patient.namaKucing} ${treatment.subValue || ""}`.trim();
+                }
               } else {
                 caption = `${treatment.modul.toLowerCase()} - ${patient.namaKucing.toLowerCase()}`;
               }
@@ -1303,6 +1231,7 @@ const connectToWhatsApp = async () => {
             let pipText = `${patient.namaKucing} tidak pip`;
             let pupText = `${patient.namaKucing} tidak pup`;
             let muntahText = "tidak muntah";
+            let combinedText = null;
 
             pippupTreatments.forEach((t) => {
               if (t.subType === "pip")
@@ -1312,18 +1241,24 @@ const connectToWhatsApp = async () => {
               else if (t.subType === "muntah")
                 muntahText = `${patient.namaKucing} ${t.subValue}`;
               else if (t.subType === "pippup_normal") {
-                pipText = `${patient.namaKucing} Pip normal`;
-                pupText = `${patient.namaKucing} Pup normal`;
+                combinedText = `${patient.namaKucing} Pip normal pup normal`;
               } else if (t.subType === "pippup_khusus") {
                 const ket = t.penjelasanKhusus || "Kondisi Khusus";
-                pipText = pupText = `${patient.namaKucing} ${ket}`;
+                combinedText = `${patient.namaKucing} ${ket}`;
               }
             });
 
-            return { pipText, pupText, muntahText };
+            return { pipText, pupText, muntahText, combinedText };
           };
 
           const toiletStatus = getToiletStatus();
+          // Tentukan string tampilan toilet untuk rangkuman
+          let toiletSummaryText = "";
+          if (toiletStatus.combinedText) {
+            toiletSummaryText = `💧 PIP & PUP💩 : ${toiletStatus.combinedText}`;
+          } else {
+            toiletSummaryText = `💧 PIP: ${toiletStatus.pipText}\n💩 PUP: ${toiletStatus.pupText}`;
+          }
 
           const summaryText = `
 🌈 *KABAR HARIAN SI MEONG* 🌈
@@ -1337,8 +1272,7 @@ const connectToWhatsApp = async () => {
 📊 *REKAP TREATMENT & KESEHATAN:*
 
 1️⃣ *Urusan Toilet:*
-💧 PIP: ${toiletStatus.pipText} 
-💩 PUP: ${toiletStatus.pupText} 
+${toiletSummaryText}
 ${toiletStatus.muntahText == "tidak muntah" ? "" : `🤮 Muntah: ${toiletStatus.muntahText}`}
 
 2️⃣ *Nafsu Makan:*
@@ -1376,6 +1310,10 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
 
           await delay(2000);
           await sock.sendMessage(ownerJid, { text: summaryText });
+
+          // DITAMBAHKAN: Set flag reportSent menjadi true dan simpan ke DB
+          patient.reportSent = true;
+          saveData(PasienPasienDB);
 
           await sock.sendMessage(
             jid,
@@ -1835,7 +1773,7 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
               // PIP & PUP
               "#SUB_PIPPUP_NORMAL_SEMUA": {
                 type: "pippup_normal",
-                value: "Normal Semua",
+                value: "Pip Pup Normal",
               },
               "#SUB_PIPPUP_KHUSUS": {
                 type: "pippup_khusus",
@@ -1918,6 +1856,80 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
 
             const targetIndex = session.data.targetIndex;
             const target = PasienPasienDB[targetIndex];
+            const currentType = session.data.subType; // 'pip', 'pup', 'muntah', 'pippup_normal', atau 'pippup_khusus'
+
+            // =========================================================================
+            // 🔄 LOGIKA REMOVAL / OVERWRITE DOKUMENTASI LAMA
+            // =========================================================================
+            // Cari index treatment PIP/PUP yang perlu dihapus dari DB
+            const indicesToRemove = [];
+
+            target.treatments.forEach((t, idx) => {
+              if (t.modul === "PIP/PUP/Muntah") {
+                // Jika input baru adalah PIP/PUP Kombinasi (Normal Semua / Khusus) -> Hapus semua PIP & PUP lama
+                if (
+                  currentType === "pippup_normal" ||
+                  currentType === "pippup_khusus"
+                ) {
+                  if (
+                    t.subType === "pip" ||
+                    t.subType === "pup" ||
+                    t.subType === "pippup_normal" ||
+                    t.subType === "pippup_khusus"
+                  ) {
+                    indicesToRemove.push(idx);
+                  }
+                }
+                // Jika input baru adalah PIP saja -> Hapus PIP lama, pippup_normal, dan pippup_khusus
+                else if (currentType === "pip") {
+                  if (
+                    t.subType === "pip" ||
+                    t.subType === "pippup_normal" ||
+                    t.subType === "pippup_khusus"
+                  ) {
+                    indicesToRemove.push(idx);
+                  }
+                }
+                // Jika input baru adalah PUP saja -> Hapus PUP lama, pippup_normal, dan pippup_khusus
+                else if (currentType === "pup") {
+                  if (
+                    t.subType === "pup" ||
+                    t.subType === "pippup_normal" ||
+                    t.subType === "pippup_khusus"
+                  ) {
+                    indicesToRemove.push(idx);
+                  }
+                }
+                // Jika input baru adalah Muntah -> Hapus Muntah lama
+                else if (currentType === "muntah") {
+                  if (t.subType === "muntah") {
+                    indicesToRemove.push(idx);
+                  }
+                }
+              }
+            });
+
+            // Hapus file media & pesan grup staf dari treatment yang bentrok (dibalik dari index terbesar agar splicing aman)
+            for (let i = indicesToRemove.length - 1; i >= 0; i--) {
+              const removeIdx = indicesToRemove[i];
+              const oldTreatment = target.treatments[removeIdx];
+
+              if (oldTreatment.mediaPath) {
+                await safeUnlink(oldTreatment.mediaPath);
+              }
+              if (oldTreatment.groupMsgKey && JID_GRUP_STAF) {
+                try {
+                  await sock.sendMessage(JID_GRUP_STAF, {
+                    delete: oldTreatment.groupMsgKey,
+                  });
+                } catch (e) {
+                  console.error("Gagal menghapus pesan lama di grup staf:", e);
+                }
+              }
+
+              target.treatments.splice(removeIdx, 1);
+            }
+            // =========================================================================
 
             const mediaBuffer = await downloadMediaMessage(
               message,
@@ -3020,8 +3032,8 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
 // =========================================================================
 // EKSEKUSI APLIKASI
 // =========================================================================
-console.log("🧪 Memulai pembersihan awal...");
-clearMediaFolder();
-resetDailyTreatments();
+// console.log("🧪 Memulai pembersihan awal...");
+// clearMediaFolder();
+// resetDailyTreatments();
 
 connectToWhatsApp();

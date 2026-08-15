@@ -33,14 +33,15 @@ if (!fs.existsSync(MEDIA_DIR)) {
 }
 
 const CATEGORIES_MAP = {
-  0: "Observasi",
-  1: "Virus Menular",
-  2: "Saluran Kemih & Ginjal",
-  3: "Kulit, Bulu & Parasit Luar",
-  4: "Saluran Pencernaan & Parasit Dalam",
-  5: "Mulut & Gigi",
-  6: "Metabolik & Hormonal",
-  7: "Jantung, Darah & Pernapasan",
+  1: "Muka",
+  2: "Mata",
+  3: "Hidung",
+  4: "Telinga",
+  5: "Kaki",
+  6: "Nafas",
+  7: "Luka",
+  8: "Testis",
+  9: "Paw",
 };
 
 // =========================================================================
@@ -55,6 +56,7 @@ const loadData = () => {
   }
 };
 
+let isPethotel = false;
 const saveData = (data) => {
   try {
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
@@ -176,6 +178,45 @@ const getButtonText = (patient, subValue, defaultText) => {
 const isReportSent = (patient) => {
   return patient && patient.reportSent === true;
 };
+// Helper untuk mengecek apakah pasien sudah diisi data treatment-nya
+// Helper untuk mengecek apakah SEMUA modul treatment wajib sudah lengkap terisi
+const isTreatmentCompleted = (patient) => {
+  if (!patient || !Array.isArray(patient.treatments)) return false;
+
+  const sesi = getSesiSaatIni();
+  const isObservasiOnly =
+    patient.categories &&
+    patient.categories.length === 1 &&
+    patient.categories.includes(0);
+
+  // Daftar modul wajib yang harus diisi
+  const requiredModules = [
+    "pip/pup/muntah",
+    "sisa makanan",
+    "makan",
+    "minum",
+    "kondisi pasien",
+  ];
+
+  // Sesi PAGI wajib isi Suhu Badan
+  if (sesi && sesi.kode === "PAGI") {
+    requiredModules.push("suhu badan");
+  }
+
+  // Jika pasien bukan Pet Hotel & bukan Observasi Only, wajib isi Infus
+  if (!patient.isPetHotel && !isObservasiOnly) {
+    requiredModules.push("infus");
+  }
+
+  const filledModules = patient.treatments.map((t) =>
+    (t.modul || "").toLowerCase().trim(),
+  );
+
+  // Mengembalikan true HANYA JIKA seluruh modul wajib sudah ada di treatments
+  return requiredModules.every((req) =>
+    filledModules.some((filled) => filled.includes(req)),
+  );
+};
 
 // =========================================================================
 // JADWAL CRON (Pembersihan Harian Jam 00:00)
@@ -197,6 +238,201 @@ cron.schedule(
     timezone: "Asia/Jakarta",
   },
 );
+// =========================================================================
+// HELPER PENGIRIMAN LAPORAN KE OWNER
+// =========================================================================
+async function sendPatientReportToOwner(sock, patient, ownerJid) {
+  // 1. Kirim Foto / Video Treatment
+  for (const treatment of patient.treatments || []) {
+    if (treatment.mediaPath && fs.existsSync(treatment.mediaPath)) {
+      let caption = "";
+      const targetIndex = session.data.targetIndex;
+      const target = PasienPasienDB[targetIndex];
+      const stage = session.data.progressTiming;
+      const bodyPart = session.data.selectedBodyPart;
+      const captionGrup = `${bodyPart} ${target.namaKucing} ${stage}`;
+      if (treatment.modul === "PIP/PUP/Muntah") {
+        if (treatment.subType === "pippup_khusus") {
+          caption =
+            `${patient.namaKucing} ${treatment.penjelasanKhusus || "kondisi khusus"}`.trim();
+        } else {
+          caption = `${patient.namaKucing} ${treatment.subValue || ""}`.trim();
+        }
+      } else {
+        caption = captionGrup;
+      }
+
+      const mediaBuffer = await fs.promises.readFile(treatment.mediaPath);
+
+      try {
+        if (treatment.mediaType === "image") {
+          await sock.sendMessage(ownerJid, {
+            image: mediaBuffer,
+            caption,
+            mimetype: "image/jpeg",
+          });
+        } else if (treatment.mediaType === "video") {
+          await sock.sendMessage(ownerJid, {
+            video: mediaBuffer,
+            caption,
+            mimetype: "video/mp4",
+          });
+        }
+      } catch (err) {
+        console.error(
+          `❌ Gagal mengirim media treatment (${treatment.modul}):`,
+          err,
+        );
+      }
+      await delay(1000);
+    }
+  }
+  const pesanDokterTreatment = (patient.treatments || []).find(
+    (t) => t.modul === "Pesan Dokter",
+  );
+  // 2. Kirim Video Injeksi
+  const injeksiTreatment = (patient.treatments || []).find(
+    (t) => t.modul === "Injeksi",
+  );
+  if (
+    injeksiTreatment &&
+    injeksiTreatment.videos &&
+    injeksiTreatment.videos.length > 0
+  ) {
+    for (let i = 0; i < injeksiTreatment.videos.length; i++) {
+      const vid = injeksiTreatment.videos[i];
+      if (vid.mediaPath && fs.existsSync(vid.mediaPath)) {
+        await sock.sendMessage(ownerJid, {
+          video: await fs.promises.readFile(vid.mediaPath),
+          caption: `📹 Video Injeksi ${i + 1} (${patient.namaKucing}): ${vid.keterangan}`,
+        });
+        await delay(1000);
+      }
+    }
+  }
+
+  // 3. Kirim Rangkuman (Summary) Teks
+  const sesi = getSesiSaatIni();
+  const tanggal = new Date().toLocaleDateString("id-ID", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+
+  const findTreatment = (modulKeyword) =>
+    (patient.treatments || []).find((t) =>
+      t.modul.toLowerCase().includes(modulKeyword.toLowerCase()),
+    );
+
+  const pantauan_makan =
+    patient.treatments.find((t) => t.modul === "Makan" && t.mediaPath)
+      ?.keterangan || "Belum ada laporan";
+  const pantauan_minum =
+    findTreatment("minum")?.keterangan || "Belum ada laporan";
+  const suhuTreatment = patient.treatments.find(
+    (t) => t.modul === "Suhu Badan",
+  );
+
+  const suhu = suhuTreatment ? parseFloat(suhuTreatment.keterangan) || 0 : 0;
+  const catatan_obat =
+    patient.treatments.find((t) => t.modul === "Treatment Obat")?.keterangan ||
+    "Tidak ada catatan obat khusus";
+  const catatan_injeksi =
+    patient.treatments.find((t) => t.modul === "Injeksi")?.keterangan ||
+    "Tidak ada injeksi";
+  const kondisi_Pasien =
+    findTreatment("kondisi")?.keterangan || "Belum ada laporan";
+  const pesanDokterText =
+    pesanDokterTreatment && pesanDokterTreatment.keterangan
+      ? pesanDokterTreatment.keterangan
+      : `Doakan ${patient.namaKucing} makin fit! 🥺🤲✨`;
+  const getToiletStatus = () => {
+    const pippupTreatments = (patient.treatments || []).filter(
+      (t) => t.modul === "PIP/PUP/Muntah",
+    );
+
+    let pipText = `${patient.namaKucing} tidak pip`;
+    let pupText = `${patient.namaKucing} tidak pup`;
+    let muntahText = "tidak muntah";
+    let combinedText = null;
+
+    pippupTreatments.forEach((t) => {
+      if (t.subType === "pip") pipText = `${patient.namaKucing} ${t.subValue}`;
+      else if (t.subType === "pup")
+        pupText = `${patient.namaKucing} ${t.subValue}`;
+      else if (t.subType === "muntah")
+        muntahText = `${patient.namaKucing} ${t.subValue}`;
+      else if (t.subType === "pippup_normal") {
+        combinedText = `${patient.namaKucing} Pip normal pup normal`;
+      } else if (t.subType === "pippup_khusus") {
+        const ket = t.penjelasanKhusus || "Kondisi Khusus";
+        combinedText = `${patient.namaKucing} ${ket}`;
+      }
+    });
+
+    return { pipText, pupText, muntahText, combinedText };
+  };
+
+  const toiletStatus = getToiletStatus();
+  let toiletSummaryText = "";
+  if (toiletStatus.combinedText) {
+    toiletSummaryText = `💧 PIP & PUP💩 : ${toiletStatus.combinedText}`;
+  } else {
+    toiletSummaryText = `💧 PIP: ${toiletStatus.pipText}\n💩 PUP: ${toiletStatus.pupText}`;
+  }
+
+  const summaryText = `
+🌈 *KABAR HARIAN SI MEONG* 🌈
+------------------------------------------
+👤 *Nama Owner:* ${formatOwnerName(patient.namaOwner)} 👋
+🐱 *Nama Kucing:* ${patient.namaKucing} 🐾✨
+📅 *Tanggal:* ${tanggal} 
+⏰ *Sesi:* 🌅 ${sesi.label}
+------------------------------------------
+
+📊 *REKAP TREATMENT & KESEHATAN:*
+
+1️⃣ *Urusan Toilet:*
+${toiletSummaryText}
+${toiletStatus.muntahText == "tidak muntah" ? "" : `🤮 Muntah: ${toiletStatus.muntahText}`}
+
+2️⃣ *Nafsu Makan:*
+${pantauan_makan} 🍗😋
+
+3️⃣ *Asupan Minum:*
+${pantauan_minum} 🥤💦
+${
+  sesi.kode === "PAGI"
+    ? `4️⃣ *Suhu Tubuh:*
+🌡️ ${
+        suhu >= 38 && suhu <= 39.4
+          ? `${suhu.toString().replace(".", ",")}°C (Suhu tubuh aman & stabil 👍)`
+          : suhu > 0
+            ? `${suhu.toString().replace(".", ",")}°C`
+            : "belum ada laporan suhu badan"
+      }`
+    : ""
+}
+${sesi.kode === "SORE" ? "4️⃣" : "5️⃣"} *Obat-obatan:* 
+💊${catatan_obat}
+
+${sesi.kode === "SORE" ? "5️⃣" : "6️⃣"} *Injeksi:*
+💉${catatan_injeksi}
+
+${sesi.kode === "SORE" ? "6️⃣" : "7️⃣"} *Status Kondisi:*
+🏃‍♂️⚡ *${kondisi_Pasien}* 🔥
+
+------------------------------------------
+💌 *Pesan dari Tim Perawat:*
+${pesanDokterText}
+
+Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! 🙏🐾❤️
+  `.trim();
+
+  await delay(1000);
+  await sock.sendMessage(ownerJid, { text: summaryText });
+}
 
 // =========================================================================
 // KONEKSI BOT & LOGIKA UTAMA
@@ -338,7 +574,7 @@ const connectToWhatsApp = async () => {
           );
         };
 
-        // Helper Menu Seleksi Kategori Penyakit
+        // Helper Menu Seleksi Kategori Organ
         const sendCategorySelectionMenu = async (session, quotedMsg) => {
           const selectedCategories = session.data.categories || [];
 
@@ -358,12 +594,12 @@ const connectToWhatsApp = async () => {
 
           const textMessage =
             selectedCategories.length === 0
-              ? "📝 *Registrasi Pasien (5/5)*\n\nSilakan pilih kategori / treatment Pasien:"
+              ? "📝 *Registrasi Pasien (5/5)*\n\nSilakan pilih bagian tubuh yang mau dipantau progressnya:"
               : `📝 *Registrasi Pasien (5/5)*\n\nKategori terpilih (${selectedCategories.length}):\n${selectedCategories
                   .map((id) => `• ${CATEGORIES_MAP[id]}`)
                   .join(
                     "\n",
-                  )}\n\n*Apakah ada lainnya?* Klik kategori untuk menambah/menghapus, atau klik *Selesai Tambah Pasien* jika sudah.`;
+                  )}\n\n*Apakah ada lainnya?* Klik bagian tubuh yang ingin dipantau progressnya, atau klik *Selesai Tambah Pasien* jika sudah.`;
 
           await sock.sendMessage(
             jid,
@@ -399,31 +635,23 @@ const connectToWhatsApp = async () => {
                 t.modul.toLowerCase().trim() === modulName.toLowerCase().trim(),
             );
 
-          const ALL_PROGRESS_PARTS = [
-            "Muka",
-            "Nafas",
-            "Luka",
-            "Telinga",
-            "Mulut",
-            "Mata",
-          ];
-          const filledPartsCount = ALL_PROGRESS_PARTS.filter((part) =>
-            selected.treatments.some(
-              (t) => t.modul === "Dokumentasi Progress" && t.bodyPart === part,
-            ),
-          ).length;
+          const treatmentsList = PasienPasienDB[targetIndex].treatments;
+          const treatmentIndex = treatmentsList.findIndex(
+            (t) =>
+              t.uploud === "success" &&
+              t.modul === "Dokumentasi Progress",
+          );
+          const data =
+            PasienPasienDB[targetIndex].treatments[treatmentIndex] || "";
+          const ModulProgressPasien =
+            data.uploud === "success" ? "✅" : "";
 
           const hasPip = selected.treatments.some(
-            (t) => t.modul === "PIP/PUP/Muntah" && t.hasPip,
+            (t) => t.modul === "PIP/PUP/Muntah" && t.subType === "pip",
           );
           const hasPup = selected.treatments.some(
-            (t) => t.modul === "PIP/PUP/Muntah" && t.hasPup,
+            (t) => t.modul === "PIP/PUP/Muntah" && t.subType === "pup",
           );
-
-          const progressLabel =
-            filledPartsCount === ALL_PROGRESS_PARTS.length
-              ? "✅"
-              : `(${filledPartsCount}/${ALL_PROGRESS_PARTS.length})`;
 
           const pipPupLabel = hasPip && hasPup ? "✅" : "⏳";
 
@@ -446,29 +674,13 @@ const connectToWhatsApp = async () => {
             },
           ];
 
-          if (sesi.kode === "PAGI") {
-            moduleButtons.push({
-              text: `Suhu Badan ${isFilled("Suhu") ? "✅" : ""}`,
-              id: "#MODUL_SUHU",
-            });
-          }
-
-          if (isObservasiOnly) {
-            moduleButtons.push(
-              {
-                text: `Treatment Obat ${isFilled("Treatment Obat") ? "✅" : ""}`,
-                id: "#MODUL_OBAT",
-              },
-              {
-                text: `Injeksi ${isFilled("Injeksi") ? "✅" : ""}`,
-                id: "#MODUL_INJEKSI",
-              },
-              {
-                text: `Kondisi Pasien ${isFilled("Kondisi Pasien") ? "✅" : ""}`,
-                id: "#MODUL_KONDISI",
-              },
-            );
-          } else {
+          if (isPethotel == false) {
+            if (sesi.kode === "PAGI") {
+              moduleButtons.push({
+                text: `Suhu Badan ${isFilled("Suhu") ? "✅" : ""}`,
+                id: "#MODUL_SUHU",
+              });
+            }
             moduleButtons.push(
               {
                 text: `Infus ${isFilled("Infus") ? "✅" : ""}`,
@@ -483,8 +695,12 @@ const connectToWhatsApp = async () => {
                 id: "#MODUL_KONDISI",
               },
               {
-                text: `Progress Pasien ${progressLabel}`,
+                text: `Progress Pasien ${ModulProgressPasien}`,
                 id: "#MODUL_PROGRESS_DISEASE",
+              },
+              {
+                text: `Pesan Dokter ${isFilled("Pesan Dokter") ? "✅" : ""}`,
+                id: "#MODUL_PESAN_DOKTER",
               },
             );
           }
@@ -739,6 +955,80 @@ const connectToWhatsApp = async () => {
           return;
         }
 
+        // =========================================================================
+        // HANDLER EKSPLISIT KONFIRMASI & EKSEKUSI HAPUS PASIEN
+        // =========================================================================
+        if (cleanText.startsWith("#ASK_Hapus_")) {
+          const idx = parseInt(cleanText.replace("#ASK_Hapus_", ""));
+          const patient = PasienPasienDB[idx];
+
+          if (!patient) {
+            await sock.sendMessage(
+              jid,
+              { text: "⚠️ Pasien tidak ditemukan." },
+              { quoted: message },
+            );
+            return;
+          }
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: `⚠️ *KONFIRMASI HAPUS PASIEN*\n\nApakah Anda yakin ingin menghapus data pasien berikut?\n\n🐱 *Kucing:* ${patient.namaKucing}\n👤 *Owner:* ${patient.namaOwner}\n🆔 *ID:* ${patient.idPasien || "-"}`,
+              buttons: [
+                { text: "❌ Yakin, Hapus", id: `#CONFIRM_DELETE_${idx}` },
+                { text: "🔙 Batal", id: "#Hapus_Pasien" },
+              ],
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
+        if (cleanText.startsWith("#CONFIRM_DELETE_")) {
+          const idx = parseInt(cleanText.replace("#CONFIRM_DELETE_", ""));
+          const patient = PasienPasienDB[idx];
+
+          if (!patient) {
+            await sock.sendMessage(
+              jid,
+              { text: "⚠️ Pasien sudah tidak ada atau telah dihapus." },
+              { quoted: message },
+            );
+            return;
+          }
+
+          // Hapus file media terkait treatment pasien ini jika ada
+          if (Array.isArray(patient.treatments)) {
+            for (const t of patient.treatments) {
+              if (t.mediaPath) await safeUnlink(t.mediaPath);
+              if (Array.isArray(t.videos)) {
+                for (const v of t.videos) {
+                  if (v.mediaPath) await safeUnlink(v.mediaPath);
+                }
+              }
+            }
+          }
+
+          // Hapus data dari array database
+          const namaKucing = patient.namaKucing;
+          PasienPasienDB.splice(idx, 1);
+          saveData(PasienPasienDB);
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: `🗑️ Data pasien *${namaKucing}* berhasil dihapus dari database!`,
+              buttons: [
+                { text: "🗑️ Hapus Pasien Lain", id: "#Hapus_Pasien" },
+                { text: "🏠 Menu Utama", id: "#MENU_UTAMA" },
+              ],
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
         if (cleanText.startsWith("#SELECT_Perbarui_")) {
           const idx = parseInt(cleanText.replace("#SELECT_Perbarui_", ""));
           const patient = PasienPasienDB[idx];
@@ -852,7 +1142,6 @@ const connectToWhatsApp = async () => {
           clearSession(jid);
           return;
         }
-
         // =========================================================================
         // TREATMENT FLOW
         // =========================================================================
@@ -862,7 +1151,7 @@ const connectToWhatsApp = async () => {
             await sock.sendMessage(
               jid,
               {
-                text: "⚠️ Data Pasien Pasien kosong.",
+                text: "⚠️ Data Pasien kosong.",
                 buttons: [{ text: "➕ Tambah Pasien", id: "#Tambah_Pasien" }],
               },
               { quoted: message },
@@ -873,7 +1162,27 @@ const connectToWhatsApp = async () => {
           await sock.sendMessage(
             jid,
             {
-              text: "💊 *Menu Treatment Pasien*\n\nPilih kategori status Pasien:",
+              text: "💊 *Menu Treatment Pasien*\n\nPilih aksi yang ingin dilakukan:",
+              buttons: [
+                { text: "📝 Input Treatment Baru", id: "#INPUT_TREATMENT_NEW" },
+                {
+                  text: "✏️ Update / Edit Treatment",
+                  id: "#UPDATE_TREATMENT_MENU",
+                },
+                { text: "🏠 Menu Utama", id: "#MENU_UTAMA" },
+              ],
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
+        // Tambahkan handler ini jika user memilih Input Baru
+        if (cleanText === "#INPUT_TREATMENT_NEW") {
+          await sock.sendMessage(
+            jid,
+            {
+              text: "💊 *Input Treatment Pasien*\n\nPilih kategori status Pasien:",
               buttons: [
                 { text: "🏨 Pet Hotel", id: "#TREATMENT_FILTER_HOTEL" },
                 { text: "🔴 Infeksius", id: "#TREATMENT_FILTER_INF" },
@@ -893,6 +1202,11 @@ const connectToWhatsApp = async () => {
         ) {
           const filterType = cleanText.replace("#TREATMENT_FILTER_", "");
 
+          if (filterType === "HOTEL") {
+            isPethotel = true;
+          } else {
+            isPethotel = false;
+          }
           const filteredList = PasienPasienDB.map((p, idx) => ({
             ...p,
             originalIndex: idx,
@@ -924,7 +1238,7 @@ const connectToWhatsApp = async () => {
           }
 
           const buttons = filteredList.slice(0, 20).map((p) => ({
-            text: `🐾 ${p.namaKucing} (${p.namaOwner})`,
+            text: `${isTreatmentCompleted(p) ? "✅ " : "🐾 "}${p.namaKucing} (${p.namaOwner})`,
             id: `#SELECT_TREATMENT_${p.originalIndex}`,
           }));
           buttons.push({ text: "🔙 Opsi Lain", id: "#TREATMENT" });
@@ -959,6 +1273,179 @@ const connectToWhatsApp = async () => {
         if (cleanText.startsWith("#SELECT_TREATMENT_")) {
           const idx = parseInt(cleanText.replace("#SELECT_TREATMENT_", ""));
           await sendTreatmentModuleMenu(idx);
+          return;
+        }
+
+        // =========================================================================
+        // FITUR UPDATE / EDIT TREATMENT PASIEN (BARU)
+        // =========================================================================
+
+        // 1. Menu Utama Update Treatment
+        if (cleanText === "#UPDATE_TREATMENT_MENU") {
+          clearSession(jid);
+          if (PasienPasienDB.length === 0) {
+            await sock.sendMessage(
+              jid,
+              {
+                text: "⚠️ Data Pasien kosong.",
+                buttons: [{ text: "🏠 Menu Utama", id: "#MENU_UTAMA" }],
+              },
+              { quoted: message },
+            );
+            return;
+          }
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: "✏️ *UPDATE TREATMENT PASIEN*\n\nPilih kategori pasien yang ingin diperbarui treatment-nya:",
+              buttons: [
+                { text: "🏨 Pet Hotel", id: "#UPDATE_TREAT_FILTER_HOTEL" },
+                { text: "🔴 Infeksius", id: "#UPDATE_TREAT_FILTER_INF" },
+                { text: "🟢 Non-Infeksius", id: "#UPDATE_TREAT_FILTER_NONINF" },
+                { text: "🏠 Menu Utama", id: "#MENU_UTAMA" },
+              ],
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
+        // 2. Handler Filter Pasien yang Sudah Diisi Treatment
+        if (
+          cleanText === "#UPDATE_TREAT_FILTER_HOTEL" ||
+          cleanText === "#UPDATE_TREAT_FILTER_INF" ||
+          cleanText === "#UPDATE_TREAT_FILTER_NONINF"
+        ) {
+          const filterType = cleanText.replace("#UPDATE_TREAT_FILTER_", "");
+
+          const filteredList = PasienPasienDB.map((p, idx) => ({
+            ...p,
+            originalIndex: idx,
+          })).filter((p) => {
+            // Hanya tampilkan pasien yang sudah diisi treatment-nya hari ini
+            const hasTreatment =
+              Array.isArray(p.treatments) && p.treatments.length > 0;
+            if (!hasTreatment) return false;
+
+            if (filterType === "INF") return p.isInfectious && !p.isPetHotel;
+            if (filterType === "NONINF")
+              return !p.isInfectious && !p.isPetHotel;
+            if (filterType === "HOTEL") return p.isPetHotel;
+            return false;
+          });
+
+          const labelMap = {
+            INF: "🔴 INFEKSIUS",
+            NONINF: "🟢 NON-INFEKSIUS",
+            HOTEL: "🏨 PET HOTEL",
+          };
+
+          if (filteredList.length === 0) {
+            await sock.sendMessage(
+              jid,
+              {
+                text: `⚠️ Tidak ada Pasien *${labelMap[filterType]}* yang memiliki data treatment untuk di-update.`,
+                buttons: [{ text: "🔙 Kembali", id: "#UPDATE_TREATMENT_MENU" }],
+              },
+              { quoted: message },
+            );
+            return;
+          }
+
+          const buttons = filteredList.slice(0, 20).map((p) => ({
+            text: `✏️ ${p.namaKucing} (${p.namaOwner})`,
+            id: `#SELECT_UPDATE_TREAT_${p.originalIndex}`,
+          }));
+          buttons.push({ text: "🔙 Kembali", id: "#UPDATE_TREATMENT_MENU" });
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: `📋 *Daftar Pasien ${labelMap[filterType]} (Update Treatment)*:\nPilih pasien yang ingin diubah datanya:`,
+              buttons,
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
+        // 3. Handler Tampilan Modul Treatment yang Sudah Pernah Diisi
+        if (cleanText.startsWith("#SELECT_UPDATE_TREAT_")) {
+          const targetIndex = parseInt(
+            cleanText.replace("#SELECT_UPDATE_TREAT_", ""),
+          );
+          const patient = PasienPasienDB[targetIndex];
+
+          if (
+            !patient ||
+            !patient.treatments ||
+            patient.treatments.length === 0
+          ) {
+            await sock.sendMessage(
+              jid,
+              {
+                text: "⚠️ Pasien tidak ditemukan atau belum memiliki treatment.",
+              },
+              { quoted: message },
+            );
+            return;
+          }
+
+          // Dapatkan daftar unik modul treatment yang SUDAH diisi
+          const existingModules = [
+            ...new Set(patient.treatments.map((t) => t.modul)),
+          ];
+
+          const moduleButtons = existingModules.map((modulName) => {
+            let buttonId = "";
+            if (modulName === "PIP/PUP/Muntah") buttonId = "#MODUL_PIP_PUP";
+            else if (modulName === "Sisa Makanan")
+              buttonId = "#MODUL_SISA_MAKANAN";
+            else if (modulName === "Makan") buttonId = "#MODUL_MAKAN";
+            else if (modulName === "Minum") buttonId = "#MODUL_MINUM";
+            else if (modulName === "Suhu Badan") buttonId = "#MODUL_SUHU";
+            else if (modulName === "Infus") buttonId = "#MODUL_INFUS";
+            else if (modulName === "Treatment Obat") buttonId = "#MODUL_OBAT";
+            else if (modulName === "Injeksi") buttonId = "#MODUL_INJEKSI";
+            else if (modulName === "Kondisi Pasien")
+              buttonId = "#MODUL_KONDISI";
+            else if (modulName === "Dokumentasi Progress")
+              buttonId = "#MODUL_PROGRESS_DISEASE";
+            else if (modulName === "Pesan Dokter")
+              buttonId = "#MODUL_PESAN_DOKTER";
+
+            return {
+              text: `✏️ Edit ${modulName}`,
+              id: buttonId,
+            };
+          });
+
+          const sesi = getSesiSaatIni();
+          setSession(jid, "SELECT_TREATMENT_MODULE", {
+            targetIndex,
+            patient,
+            sesiKode: sesi.kode,
+            sesiLabel: sesi.label,
+            isUpdateMode: true, // Flag penanda mode update
+          });
+
+          moduleButtons.push(
+            {
+              text: "🏁 Selesai Update",
+              id: `#FINISH_TREATMENT_${targetIndex}`,
+            },
+            { text: "🏠 Menu Utama", id: "#MENU_UTAMA" },
+          );
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: `✏️ *EDIT TREATMENT: ${patient.namaKucing}*\n\nPilih modul yang ingin diubah/di-update:`,
+              buttons: moduleButtons,
+            },
+            { quoted: message },
+          );
           return;
         }
 
@@ -1056,8 +1543,6 @@ const connectToWhatsApp = async () => {
           const patient = PasienPasienDB[idx];
           if (!patient) return;
 
-          const ownerJid = `${patient.noHp}@s.whatsapp.net`;
-
           if (!patient.treatments || patient.treatments.length === 0) {
             await sock.sendMessage(
               jid,
@@ -1069,6 +1554,63 @@ const connectToWhatsApp = async () => {
             return;
           }
 
+          await sock.sendMessage(
+            jid,
+            {
+              text: `📲 *OPSI LAPORAN OWNER*\n\nPasien: *${patient.namaKucing}*\nOwner: *${formatOwnerName(patient.namaOwner)}*\n\nSilakan pilih aksi:`,
+              buttons: [
+                { text: "🚀 Kirim Sekarang", id: `#EXEC_SEND_NOW_${idx}` },
+                { text: "👁️ Preview", id: `#PREVIEW_REPORT_${idx}` },
+                { text: "🔙 Kembali", id: "#KIRIM_OWNER" },
+              ],
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
+        // -------------------------------------------------------------------------
+        // HANDLER TOMBOL PREVIEW LAPORAN (KIRIM FOTO/VIDEO & RANGKUMAN KE PENGIRIM)
+        // -------------------------------------------------------------------------
+        if (cleanText.startsWith("#PREVIEW_REPORT_")) {
+          const idx = parseInt(cleanText.replace("#PREVIEW_REPORT_", ""));
+          const patient = PasienPasienDB[idx];
+          if (!patient) return;
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: `🔍 *Mempersiapkan preview laporan ${patient.namaKucing}...*`,
+            },
+            { quoted: message },
+          );
+
+          // Mengirimkan preview media & rangkuman langsung ke JID pengirim (bot chat/grup staf)
+          await sendPatientReportToOwner(sock, patient, jid);
+
+          await sock.sendMessage(
+            jid,
+            {
+              text: `👀 *Preview laporan untuk ${patient.namaKucing} telah ditampilkan di atas.*`,
+              buttons: [
+                { text: "🚀 Kirim Sekarang", id: `#EXEC_SEND_NOW_${idx}` },
+                { text: "🔙 Kembali", id: "#KIRIM_OWNER" },
+              ],
+            },
+            { quoted: message },
+          );
+          return;
+        }
+
+        // -------------------------------------------------------------------------
+        // HANDLER TOMBOL EXECUTE KIRIM SEKARANG KE OWNER
+        // -------------------------------------------------------------------------
+        if (cleanText.startsWith("#EXEC_SEND_NOW_")) {
+          const idx = parseInt(cleanText.replace("#EXEC_SEND_NOW_", ""));
+          const patient = PasienPasienDB[idx];
+          if (!patient) return;
+
+          const ownerJid = `${patient.noHp}@s.whatsapp.net`;
           const sesi = getSesiSaatIni();
           const isObservasiOnly =
             patient.categories.length === 1 && patient.categories.includes(0);
@@ -1114,7 +1656,6 @@ const connectToWhatsApp = async () => {
             return;
           }
 
-          // 1. DAHULUKAN PESAN MEMPERSIAPKAN & MENGIRIM LAPORAN
           await sock.sendMessage(
             jid,
             {
@@ -1123,195 +1664,9 @@ const connectToWhatsApp = async () => {
             { quoted: message },
           );
 
-          // 2. KIRIM FOTO / VIDEO DARI TREATMENT (PIP, PUP, MUNTAH, SISA MAKANAN, MAKAN, MINUM, DLL.)
-          for (const treatment of patient.treatments) {
-            if (treatment.mediaPath && fs.existsSync(treatment.mediaPath)) {
-              let caption = "";
-              if (treatment.modul === "PIP/PUP/Muntah") {
-                if (treatment.subType === "pippup_khusus") {
-                  // Utamakan penjelasan khusus dari user
-                  caption =
-                    `${patient.namaKucing} ${treatment.penjelasanKhusus || "kondisi khusus"}`.trim();
-                } else {
-                  caption =
-                    `${patient.namaKucing} ${treatment.subValue || ""}`.trim();
-                }
-              } else {
-                caption = `${treatment.modul.toLowerCase()} - ${patient.namaKucing.toLowerCase()}`;
-              }
-              const mediaBuffer = await fs.promises.readFile(
-                treatment.mediaPath,
-              );
+          // Jalankan pengiriman ke WhatsApp owner
+          await sendPatientReportToOwner(sock, patient, ownerJid);
 
-              try {
-                if (treatment.mediaType === "image") {
-                  await sock.sendMessage(ownerJid, {
-                    image: mediaBuffer,
-                    caption,
-                    mimetype: "image/jpeg",
-                  });
-                } else if (treatment.mediaType === "video") {
-                  await sock.sendMessage(ownerJid, {
-                    video: mediaBuffer,
-                    caption,
-                    mimetype: "video/mp4",
-                  });
-                }
-              } catch (err) {
-                console.error(
-                  `❌ Gagal mengirim media treatment (${treatment.modul}):`,
-                  err,
-                );
-              }
-              await delay(1000);
-            }
-          }
-
-          // 3. KIRIM VIDEO INJEKSI (JIKA ADA)
-          const injeksiTreatment = patient.treatments.find(
-            (t) => t.modul === "Injeksi",
-          );
-
-          if (
-            injeksiTreatment &&
-            injeksiTreatment.videos &&
-            injeksiTreatment.videos.length > 0
-          ) {
-            for (let i = 0; i < injeksiTreatment.videos.length; i++) {
-              const vid = injeksiTreatment.videos[i];
-              if (vid.mediaPath && fs.existsSync(vid.mediaPath)) {
-                await sock.sendMessage(ownerJid, {
-                  video: await fs.promises.readFile(vid.mediaPath),
-                  caption: `📹 Video Injeksi ${i + 1} (${patient.namaKucing}): ${vid.keterangan}`,
-                });
-                await delay(1000);
-              }
-            }
-          }
-
-          // 4. TERAKHIR KIRIM RANGKUMAN (SUMMARY)
-          const tanggal = new Date().toLocaleDateString("id-ID", {
-            weekday: "long",
-            year: "numeric",
-            month: "long",
-            day: "numeric",
-          });
-
-          const findTreatment = (modulKeyword) =>
-            patient.treatments.find((t) =>
-              t.modul.toLowerCase().includes(modulKeyword.toLowerCase()),
-            );
-
-          const pantauan_makan =
-            patient.treatments.find((t) => t.modul === "Makan" && t.mediaPath)
-              ?.keterangan || "Belum ada laporan";
-          const pantauan_minum =
-            findTreatment("minum")?.keterangan || "Belum ada laporan";
-          const suhuTreatment = patient.treatments.find(
-            (t) => t.modul === "Suhu Badan",
-          );
-
-          const suhu = suhuTreatment
-            ? parseFloat(suhuTreatment.keterangan) || 0
-            : 0;
-          const catatan_obat =
-            patient.treatments.find((t) => t.modul === "Treatment Obat")
-              ?.keterangan || "Tidak ada catatan obat khusus";
-          const catatan_injeksi =
-            patient.treatments.find((t) => t.modul === "Injeksi")?.keterangan ||
-            "Tidak ada injeksi";
-          const kondisi_Pasien =
-            findTreatment("kondisi")?.keterangan || "Belum ada laporan";
-
-          const getToiletStatus = () => {
-            const pippupTreatments = (patient.treatments || []).filter(
-              (t) => t.modul === "PIP/PUP/Muntah",
-            );
-
-            let pipText = `${patient.namaKucing} tidak pip`;
-            let pupText = `${patient.namaKucing} tidak pup`;
-            let muntahText = "tidak muntah";
-            let combinedText = null;
-
-            pippupTreatments.forEach((t) => {
-              if (t.subType === "pip")
-                pipText = `${patient.namaKucing} ${t.subValue}`;
-              else if (t.subType === "pup")
-                pupText = `${patient.namaKucing} ${t.subValue}`;
-              else if (t.subType === "muntah")
-                muntahText = `${patient.namaKucing} ${t.subValue}`;
-              else if (t.subType === "pippup_normal") {
-                combinedText = `${patient.namaKucing} Pip normal pup normal`;
-              } else if (t.subType === "pippup_khusus") {
-                const ket = t.penjelasanKhusus || "Kondisi Khusus";
-                combinedText = `${patient.namaKucing} ${ket}`;
-              }
-            });
-
-            return { pipText, pupText, muntahText, combinedText };
-          };
-
-          const toiletStatus = getToiletStatus();
-          // Tentukan string tampilan toilet untuk rangkuman
-          let toiletSummaryText = "";
-          if (toiletStatus.combinedText) {
-            toiletSummaryText = `💧 PIP & PUP💩 : ${toiletStatus.combinedText}`;
-          } else {
-            toiletSummaryText = `💧 PIP: ${toiletStatus.pipText}\n💩 PUP: ${toiletStatus.pupText}`;
-          }
-
-          const summaryText = `
-🌈 *KABAR HARIAN SI MEONG* 🌈
-------------------------------------------
-👤 *Nama Owner:* ${formatOwnerName(patient.namaOwner)} 👋
-🐱 *Nama Kucing:* ${patient.namaKucing} 🐾✨
-📅 *Tanggal:* ${tanggal} 
-⏰ *Sesi:* 🌅 ${sesi.label}
-------------------------------------------
-
-📊 *REKAP TREATMENT & KESEHATAN:*
-
-1️⃣ *Urusan Toilet:*
-${toiletSummaryText}
-${toiletStatus.muntahText == "tidak muntah" ? "" : `🤮 Muntah: ${toiletStatus.muntahText}`}
-
-2️⃣ *Nafsu Makan:*
-${pantauan_makan} 🍗😋
-
-3️⃣ *Asupan Minum:*
-${pantauan_minum} 🥤💦
-${
-  sesi.kode === "PAGI"
-    ? `4️⃣ *Suhu Tubuh:*
-🌡️ ${
-        suhu >= 38 && suhu <= 39.4
-          ? `${suhu.toString().replace(".", ",")}°C (Suhu tubuh aman & stabil 👍)`
-          : suhu > 0
-            ? `${suhu.toString().replace(".", ",")}°C`
-            : "belum ada laporan suhu badan"
-      }`
-    : ""
-}
-${sesi.kode === "SORE" ? "4️⃣" : "5️⃣"} *Obat-obatan:* 
-💊${catatan_obat}
-
-${sesi.kode === "SORE" ? "5️⃣" : "6️⃣"} *Injeksi:*
-💉${catatan_injeksi}
-
-${sesi.kode === "SORE" ? "6️⃣" : "7️⃣"} *Status Kondisi:*
-🏃‍♂️⚡ *${kondisi_Pasien}* 🔥
-
-------------------------------------------
-💌 *Pesan dari Tim Perawat:*
-"Doakan ${patient.namaKucing} makin fit!" 🥺🤲✨
-
-Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! 🙏🐾❤️
-          `.trim();
-
-          await delay(2000);
-          await sock.sendMessage(ownerJid, { text: summaryText });
-
-          // DITAMBAHKAN: Set flag reportSent menjadi true dan simpan ke DB
           patient.reportSent = true;
           saveData(PasienPasienDB);
 
@@ -1436,28 +1791,108 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
             }
 
             if (cleanText === "#FINISH_Tambah_Pasien") {
-              if (session.data.categories.length === 0)
-                session.data.categories.push(0);
+              // 1. Jika belum memilih kategori sama sekali, beri default 0 (Observasi)
+              if (
+                !session.data.categories ||
+                session.data.categories.length === 0
+              ) {
+                session.data.categories = [0];
+              }
 
+              // 2. Tentukan ID unik dan Tanggal
               session.data.idPasien = `OPN-${Math.floor(1000 + Math.random() * 9000)}`;
               session.data.tanggalWaktu = new Date().toLocaleString("id-ID", {
                 timeZone: "Asia/Jakarta",
               });
-              session.data.categories = session.data.categories || [];
-              session.data.treatments = [];
 
-              PasienPasienDB.push(session.data);
+              // 3. (OPSIONAL/DIANJURKAN) Konversi ID Angka menjadi Teks Kategori agar JSON mudah dibaca
+              const namaKategoriList = session.data.categories.map(
+                (catId) => CATEGORIES_MAP[catId] || "Observasi Umum",
+              );
+
+              // 4. Susun struktur Object Pasien yang fix untuk disimpan ke JSON
+              const dataPasienBaru = {
+                idPasien: session.data.idPasien,
+                tanggalWaktu: session.data.tanggalWaktu,
+                namaOwner: session.data.namaOwner,
+                namaKucing: session.data.namaKucing,
+                noHp: session.data.noHp,
+                isInfectious: session.data.isInfectious,
+                isPetHotel: session.data.isPetHotel,
+                categories: session.data.categories, // Menyimpan ID [1, 2, 3]
+                categoriesNama: namaKategoriList, // Menyimpan Nama ["Muka", "Mata", "Hidung"]
+                treatments: [],
+              };
+
+              // 5. Simpan ke database JSON
+              PasienPasienDB.push(dataPasienBaru);
               saveData(PasienPasienDB);
               clearSession(jid);
 
-              const daftarKategoriText = session.data.categories
-                .map((catId) => `• ${CATEGORIES_MAP[catId]}`)
+              const daftarKategoriText = namaKategoriList
+                .map((nama) => `• ${nama}`)
                 .join("\n");
 
               await sock.sendMessage(
                 jid,
                 {
-                  text: `🎉 *DATA Pasien BERHASIL DISIMPAN!*\n\nID: ${session.data.idPasien}\nOwner: ${session.data.namaOwner}\nKucing: ${session.data.namaKucing}\nStatus: ${session.data.isInfectious ? "🔴 Infeksius" : "🟢 Non-Infeksius"}\n\n*Kategori Penyakit:*\n${daftarKategoriText}`,
+                  text: `🎉 *DATA PASIEN BERHASIL DISIMPAN!*\n\nID: ${dataPasienBaru.idPasien}\nOwner: ${dataPasienBaru.namaOwner}\nKucing: ${dataPasienBaru.namaKucing}\nStatus: ${dataPasienBaru.isInfectious ? "🔴 Infeksius" : "🟢 Non-Infeksius"}\n\n*Tubuh Yang Dipantau Progressnya:*\n${daftarKategoriText}`,
+                  buttons: [
+                    { text: "➕ Tambah Pasien Lagi", id: "#Tambah_Pasien" },
+                    { text: "💊 Ke Menu Treatment", id: "#TREATMENT" },
+                  ],
+                },
+                { quoted: message },
+              );
+              return;
+            }
+            if (cleanText === "#FINISH_Tambah_Pasien") {
+              // 1. Jika belum memilih kategori sama sekali, beri default 0 (Observasi)
+              if (
+                !session.data.categories ||
+                session.data.categories.length === 0
+              ) {
+                session.data.categories = [0];
+              }
+
+              // 2. Tentukan ID unik dan Tanggal
+              session.data.idPasien = `OPN-${Math.floor(1000 + Math.random() * 9000)}`;
+              session.data.tanggalWaktu = new Date().toLocaleString("id-ID", {
+                timeZone: "Asia/Jakarta",
+              });
+
+              // 3. (OPSIONAL/DIANJURKAN) Konversi ID Angka menjadi Teks Kategori agar JSON mudah dibaca
+              const namaKategoriList = session.data.categories.map(
+                (catId) => CATEGORIES_MAP[catId] || "Observasi Umum",
+              );
+
+              // 4. Susun struktur Object Pasien yang fix untuk disimpan ke JSON
+              const dataPasienBaru = {
+                idPasien: session.data.idPasien,
+                tanggalWaktu: session.data.tanggalWaktu,
+                namaOwner: session.data.namaOwner,
+                namaKucing: session.data.namaKucing,
+                noHp: session.data.noHp,
+                isInfectious: session.data.isInfectious,
+                isPetHotel: session.data.isPetHotel,
+                categories: session.data.categories, // Menyimpan ID [1, 2, 3]
+                categoriesNama: namaKategoriList, // Menyimpan Nama ["Muka", "Mata", "Hidung"]
+                treatments: [],
+              };
+
+              // 5. Simpan ke database JSON
+              PasienPasienDB.push(dataPasienBaru);
+              saveData(PasienPasienDB);
+              clearSession(jid);
+
+              const daftarKategoriText = namaKategoriList
+                .map((nama) => `• ${nama}`)
+                .join("\n");
+
+              await sock.sendMessage(
+                jid,
+                {
+                  text: `🎉 *DATA PASIEN BERHASIL DISIMPAN!*\n\nID: ${dataPasienBaru.idPasien}\nOwner: ${dataPasienBaru.namaOwner}\nKucing: ${dataPasienBaru.namaKucing}\nStatus: ${dataPasienBaru.isInfectious ? "🔴 Infeksius" : "🟢 Non-Infeksius"}\n\n*Tubuh Yang Dipantau Progressnya:*\n${daftarKategoriText}`,
                   buttons: [
                     { text: "➕ Tambah Pasien Lagi", id: "#Tambah_Pasien" },
                     { text: "💊 Ke Menu Treatment", id: "#TREATMENT" },
@@ -1597,6 +2032,21 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
                     { text: "❌ Tidak Ada Injeksi", id: "#INJEKSI_TIDAK" },
                     { text: "🔙 Kembali", id: "#BACK_TO_MODULE_MENU" },
                   ],
+                },
+                { quoted: message },
+              );
+              return;
+            }
+            if (selectedModulKey === "#MODUL_PESAN_DOKTER") {
+              setSession(jid, "WAITING_GENERIC_TEXT", {
+                ...session.data,
+                selectedModulName: "Pesan Dokter",
+              });
+              await sock.sendMessage(
+                jid,
+                {
+                  text: `🩺 Ketik *Pesan Dokter* untuk pasien *${session.data.patient.namaKucing}*:`,
+                  buttons: [{ text: "🔙 Kembali", id: "#BACK_TO_MODULE_MENU" }],
                 },
                 { quoted: message },
               );
@@ -1995,18 +2445,16 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
             const target = PasienPasienDB[targetIndex];
 
             const oldTreatmentIndex = target.treatments.findIndex(
-              (t) => t.modul === "Sisa Makanan",
+              (t) => t.modul === "NAMA_MODUL",
             );
             if (oldTreatmentIndex > -1) {
               const oldTreatment = target.treatments[oldTreatmentIndex];
-              if (oldTreatment.mediaPath) {
+              if (oldTreatment.mediaPath)
                 await safeUnlink(oldTreatment.mediaPath);
-              }
-              if (oldTreatment.groupMsgKey) {
+              if (oldTreatment.groupMsgKey)
                 await sock.sendMessage(JID_GRUP_STAF, {
                   delete: oldTreatment.groupMsgKey,
                 });
-              }
               target.treatments.splice(oldTreatmentIndex, 1);
             }
 
@@ -2365,99 +2813,185 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
             return;
           }
 
-          // SUB-HANDLER: PROGRESS Pasien
-          if (
-            session.step === "SELECT_TREATMENT_MODULE" &&
-            cleanText === "#MODUL_PROGRESS_DISEASE"
-          ) {
-            const targetIndex = session.data.targetIndex;
-            const target = PasienPasienDB[targetIndex];
+          // =========================================================================
+          // HANDLER MODUL PROGRESS PASIEN
+          // =========================================================================
+          if (cleanText === "#MODUL_PROGRESS_DISEASE") {
+            const patient = session.data.patient;
+            const categoriesNama = patient.categoriesNama || [];
 
-            const isPartFilled = (partName) =>
-              target.treatments.some(
+            if (
+              categoriesNama.length === 0 ||
+              (categoriesNama.length === 1 &&
+                categoriesNama[0] === "Observasi Umum")
+            ) {
+              await sock.sendMessage(
+                jid,
+                {
+                  text: `⚠️ Pasien *${patient.namaKucing}* tidak memiliki daftar pemantauan bagian tubuh khusus (Observasi Umum).`,
+                  buttons: [{ text: "🔙 Kembali", id: "#BACK_TO_MODULE_MENU" }],
+                },
+                { quoted: message },
+              );
+              return;
+            }
+
+            const categoryButtons = categoriesNama.map((namaKategori) => {
+              const isFilled = (patient.treatments || []).some(
                 (t) =>
-                  t.modul === "Dokumentasi Progress" && t.bodyPart === partName,
+                  t.modul === "Dokumentasi Progress" &&
+                  t.bodyPart === namaKategori &&
+                  t.uploud === "success",
               );
 
-            setSession(jid, "WAITING_PROGRESS_BODY_PART", session.data);
-            await sock.sendMessage(
-              jid,
-              {
-                text: "📷 *DOKUMENTASI PROGRESS Pasien (Opsional)*\n\nPilih bagian tubuh yang ingin didokumentasikan:",
-                buttons: [
-                  {
-                    text: `🐱 Muka ${isPartFilled("Muka") ? "✅" : ""}`,
-                    id: "#PROG_MUKA",
-                  },
-                  {
-                    text: `🫁 Nafas ${isPartFilled("Nafas") ? "✅" : ""}`,
-                    id: "#PROG_NAFAS",
-                  },
-                  {
-                    text: `🩹 Luka ${isPartFilled("Luka") ? "✅" : ""}`,
-                    id: "#PROG_LUKA",
-                  },
-                  {
-                    text: `👂 Telinga ${isPartFilled("Telinga") ? "✅" : ""}`,
-                    id: "#PROG_TELINGA",
-                  },
-                  {
-                    text: `👄 Mulut ${isPartFilled("Mulut") ? "✅" : ""}`,
-                    id: "#PROG_MULUT",
-                  },
-                  {
-                    text: `👁️ Mata ${isPartFilled("Mata") ? "✅" : ""}`,
-                    id: "#PROG_MATA",
-                  },
-                  {
-                    text: "🔙 Kembali ke Menu Modul",
-                    id: "#BACK_TO_MODULE_MENU",
-                  },
-                ],
-              },
-              { quoted: message },
-            );
-            return;
-          }
-
-          if (
-            session.step === "WAITING_PROGRESS_BODY_PART" &&
-            cleanText.startsWith("#PROG_")
-          ) {
-            const partMap = {
-              "#PROG_MUKA": "Muka",
-              "#PROG_NAFAS": "Nafas",
-              "#PROG_LUKA": "Luka",
-              "#PROG_TELINGA": "Telinga",
-              "#PROG_MULUT": "Mulut",
-              "#PROG_MATA": "Mata",
-            };
-
-            setSession(jid, "WAITING_PROGRESS_MEDIA", {
-              ...session.data,
-              bodyPart: partMap[cleanText] || "Progress Bagian Tubuh",
+              return {
+                text: `${isFilled ? "✅" : ""}${namaKategori}`,
+                id: `#PROGRESS_PART_${namaKategori.toUpperCase()}`,
+              };
             });
 
+            categoryButtons.push({
+              text: "🔙 Kembali ke Menu Modul",
+              id: "#BACK_TO_MODULE_MENU",
+            });
+
+            setSession(
+              jid,
+              "WAITING_PROGRESS_BODY_PART_SELECTION",
+              session.data,
+            );
+
             await sock.sendMessage(
               jid,
               {
-                text: `📸 Kirim *Foto / Video* progress untuk bagian *${userSessions[jid].data.bodyPart}*:`,
-                buttons: [
-                  { text: "🔙 Kembali", id: "#MODUL_PROGRESS_DISEASE" },
-                ],
+                text: `🩺 *DOKUMENTASI PROGRESS PASIEN (${patient.namaKucing})*\n\nPilih bagian tubuh yang ingin didokumentasikan progressnya:`,
+                buttons: categoryButtons,
               },
               { quoted: message },
             );
             return;
           }
 
+          // =========================================================================
+          // HANDLER SELEKSI BAGIAN TUBUH UNTUK PROGRESS PASIEN
+          // =========================================================================
+          if (session.step === "WAITING_PROGRESS_BODY_PART_SELECTION") {
+            if (cleanText.startsWith("#PROGRESS_PART_")) {
+              const selectedPartRaw =
+                cleanText.replace("#PROGRESS_PART_", "") || "";
+              const patient = session.data.patient;
+              const matchedPart =
+                (patient?.categoriesNama || []).find(
+                  (cat) =>
+                    (cat || "").toUpperCase() === selectedPartRaw.toUpperCase(),
+                ) || selectedPartRaw;
+
+              // Simpan organ yang dipilih
+              setSession(jid, "WAITING_PROGRESS_TIMING_SELECTION", {
+                ...session.data,
+                selectedBodyPart: matchedPart,
+              });
+              const filterType = cleanText.replace("#TREATMENT_FILTER_", "");
+
+              const targetIndex = session.data.targetIndex;
+              const treatmentsList = PasienPasienDB[targetIndex].treatments;
+              const treatmentIndexBefore = treatmentsList.findIndex(
+                (t) =>
+                  t.bodyPart === matchedPart &&
+                  t.stage === "Sebelum dibersihkan" &&
+                  t.modul === "Dokumentasi Progress",
+              );
+              const treatmentIndexAfter = treatmentsList.findIndex(
+                (t) =>
+                  t.bodyPart === matchedPart &&
+                  t.stage === "Sesudah dibersihkan" &&
+                  t.modul === "Dokumentasi Progress",
+              );
+              const dataBefore =
+                PasienPasienDB[targetIndex].treatments[treatmentIndexBefore] ||
+                "";
+              const dataAfter =
+                PasienPasienDB[targetIndex].treatments[treatmentIndexAfter] ||
+                "";
+              const hasDoneBefore =
+                dataBefore.stage === "Sebelum dibersihkan" ? "✅" : "";
+              const hasDoneAfter =
+                dataAfter.stage === "Sesudah dibersihkan" ? "✅" : "";
+
+              const displayPart = (matchedPart || "").toUpperCase();
+
+              await sock.sendMessage(
+                jid,
+                {
+                  text: `🩺 *DOKUMENTASI PROGRESS: ${displayPart} (${patient.namaKucing})*\n\nPilih opsi kondisi dokumentasi:`,
+                  buttons: [
+                    {
+                      text: `⏳ Sebelum Dibersihkan ${hasDoneBefore}`,
+                      id: "#PROGRESS_BEFORE",
+                    },
+                    {
+                      text: `✨ Sesudah Dibersihkan ${hasDoneAfter}`,
+                      id: "#PROGRESS_AFTER",
+                    },
+                    {
+                      text: "🔙 Kembali Pilih Organ",
+                      id: "#MODUL_PROGRESS_DISEASE",
+                    },
+                  ],
+                },
+                { quoted: message },
+              );
+              return;
+            }
+          }
+
+          // =========================================================================
+          // HANDLER PILIHAN SEBELUM / SESUDAH / KEMBALI
+          // =========================================================================
+          if (session.step === "WAITING_PROGRESS_TIMING_SELECTION") {
+            if (cleanText === "#MODUL_PROGRESS_DISEASE") {
+              // Jika memilih Kembali, arahkan ulang ke daftar pilih organ
+              delete session.data.selectedBodyPart;
+              // Panggil ulang menu modul progress pasien
+              cleanText = "#MODUL_PROGRESS_DISEASE";
+            } else if (
+              cleanText === "#PROGRESS_BEFORE" ||
+              cleanText === "#PROGRESS_AFTER"
+            ) {
+              const isBefore = cleanText === "#PROGRESS_BEFORE";
+              const timingLabel = isBefore
+                ? "Sebelum Dibersihkan"
+                : "Sesudah Dibersihkan";
+              const timingCode = isBefore
+                ? "Sebelum dibersihkan"
+                : "Sesudah dibersihkan";
+
+              setSession(jid, "WAITING_PROGRESS_MEDIA", {
+                ...session.data,
+                progressTiming: timingCode,
+                progressTimingLabel: timingLabel,
+              });
+
+              await sock.sendMessage(
+                jid,
+                {
+                  text: `📸 *Progress ${session.data.selectedBodyPart} - ${timingLabel} (${session.data.patient.namaKucing})*\n\nSilakan kirimkan *Foto atau Video* kondisi organ *${session.data.selectedBodyPart}* (${timingLabel.toLowerCase()}):`,
+                  buttons: [
+                    { text: "🔙 Kembali", id: "#PROGRESS_RESELECT_TIMING" },
+                  ],
+                },
+                { quoted: message },
+              );
+              return;
+            }
+          }
+
+          // 2. Saat User Mengirim Media (Foto/Video)
           if (session.step === "WAITING_PROGRESS_MEDIA") {
             if (!isImage && !isVideo) {
               await sock.sendMessage(
                 jid,
-                {
-                  text: `⚠️ Mohon kirimkan *Foto atau Video* untuk bagian *${session.data.bodyPart}*!`,
-                },
+                { text: "⚠️ Mohon kirimkan bukti berupa Foto atau Video!" },
                 { quoted: message },
               );
               return;
@@ -2465,24 +2999,8 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
 
             const targetIndex = session.data.targetIndex;
             const target = PasienPasienDB[targetIndex];
-
-            const oldTreatmentIndex = target.treatments.findIndex(
-              (t) =>
-                t.modul === "Dokumentasi Progress" &&
-                t.bodyPart === session.data.bodyPart,
-            );
-            if (oldTreatmentIndex > -1) {
-              const oldTreatment = target.treatments[oldTreatmentIndex];
-              if (oldTreatment.mediaPath) {
-                await safeUnlink(oldTreatment.mediaPath);
-              }
-              if (oldTreatment.groupMsgKey) {
-                await sock.sendMessage(JID_GRUP_STAF, {
-                  delete: oldTreatment.groupMsgKey,
-                });
-              }
-              target.treatments.splice(oldTreatmentIndex, 1);
-            }
+            const stage = session.data.progressTiming;
+            const bodyPart = session.data.selectedBodyPart;
 
             const mediaBuffer = await downloadMediaMessage(
               message,
@@ -2490,83 +3008,95 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
               {},
               { logger, reuploadRequest: sock.updateMediaMessage },
             );
+
             const ext = isVideo ? "mp4" : "jpg";
-            const savedPath = path.join(MEDIA_DIR, `prog_${Date.now()}.${ext}`);
+            const savedPath = path.join(
+              MEDIA_DIR,
+              `progress_${bodyPart}_${stage}_${Date.now()}.${ext}`,
+            );
             await fs.promises.writeFile(savedPath, mediaBuffer);
 
-            const captionText = `progress ${session.data.bodyPart.toLowerCase()} ${target.namaKucing.toLowerCase()}(${formatOwnerName(target.namaOwner).toLowerCase()})`;
+            const captionGrup = `${bodyPart} ${target.namaKucing} ${stage}`;
 
             let groupMsgKey = null;
             if (JID_GRUP_STAF && JID_GRUP_STAF.endsWith("@g.us")) {
-              const payload = { caption: captionText };
+              const payload = { caption: captionGrup };
               if (isVideo) payload.video = mediaBuffer;
               else payload.image = mediaBuffer;
-              const sentMsg = await sock.sendMessage(JID_GRUP_STAF, payload);
-              groupMsgKey = sentMsg.key;
+
+              try {
+                const sentMsg = await sock.sendMessage(JID_GRUP_STAF, payload);
+                groupMsgKey = sentMsg.key;
+              } catch (err) {
+                console.error(
+                  "❌ Gagal mengirim progress pasien ke grup staf:",
+                  err,
+                );
+              }
             }
 
+            // Hapus dokumentasi lama dengan organ & stage yang sama jika ada (Overwrite)
+            target.treatments = target.treatments.filter(
+              (t) =>
+                !(
+                  t.modul === "Dokumentasi Progress" &&
+                  t.bodyPart === bodyPart &&
+                  t.stage === stage
+                ),
+            );
+
+            // Simpan treatment baru
             target.treatments.push({
               modul: "Dokumentasi Progress",
-              bodyPart: session.data.bodyPart,
-              keterangan: captionText,
+              bodyPart: bodyPart,
+              stage: stage,
+              keterangan: `${bodyPart} ${target.namaKucing} ${stage}`,
               mediaPath: savedPath,
               mediaType: isVideo ? "video" : "image",
-              groupMsgKey,
+              uploud: "pending",
             });
+
+            const hasSebelum = target.treatments.some(
+              (t) =>
+                t.modul === "Dokumentasi Progress" &&
+                t.bodyPart === bodyPart &&
+                t.stage === "Sebelum dibersihkan",
+            );
+            const hasSesudah = target.treatments.some(
+              (t) =>
+                t.modul === "Dokumentasi Progress" &&
+                t.bodyPart === bodyPart &&
+                t.stage === "Sesudah dibersihkan",
+            );
+
+            // 3. JIKA KEDUA PROGRESS SUDAH TERISI, TAMBAHKAN PERINGKAT/KETERANGAN "uploud": "success" KE KEDUA TREATMENT TERSEBUT
+            if (hasSebelum && hasSesudah) {
+              target.treatments.forEach((t) => {
+                if (
+                  t.modul === "Dokumentasi Progress" &&
+                  t.bodyPart === bodyPart &&
+                  (t.stage === "Sebelum dibersihkan" ||
+                    t.stage === "Sesudah dibersihkan")
+                ) {
+                  t.uploud = "success";
+                }
+              });
+            }
+
             saveData(PasienPasienDB);
 
             await sock.sendMessage(
               jid,
               {
-                text: `✅ *Dokumentasi ${session.data.bodyPart} Berhasil Dicatat!*`,
+                text:
+                  `✅ Berhasil menyimpan foto/video *${bodyPart}* *${target.namaKucing}* *${stage}*` +
+                  (hasSebelum && hasSesudah
+                    ? `\n🎉 *Progress ${bodyPart} Lengkap (Upload Success)!*`
+                    : ""),
               },
               { quoted: message },
             );
-
-            const isPartFilled = (partName) =>
-              target.treatments.some(
-                (t) =>
-                  t.modul === "Dokumentasi Progress" && t.bodyPart === partName,
-              );
-
-            setSession(jid, "WAITING_PROGRESS_BODY_PART", session.data);
-            await sock.sendMessage(
-              jid,
-              {
-                text: "📷 Pilih bagian tubuh lain yang ingin didokumentasikan, atau klik *Kembali* jika sudah selesai:",
-                buttons: [
-                  {
-                    text: `🐱 Muka ${isPartFilled("Muka") ? "✅" : ""}`,
-                    id: "#PROG_MUKA",
-                  },
-                  {
-                    text: `🫁 Nafas ${isPartFilled("Nafas") ? "✅" : ""}`,
-                    id: "#PROG_NAFAS",
-                  },
-                  {
-                    text: `🩹 Luka ${isPartFilled("Luka") ? "✅" : ""}`,
-                    id: "#PROG_LUKA",
-                  },
-                  {
-                    text: `👂 Telinga ${isPartFilled("Telinga") ? "✅" : ""}`,
-                    id: "#PROG_TELINGA",
-                  },
-                  {
-                    text: `👄 Mulut ${isPartFilled("Mulut") ? "✅" : ""}`,
-                    id: "#PROG_MULUT",
-                  },
-                  {
-                    text: `👁️ Mata ${isPartFilled("Mata") ? "✅" : ""}`,
-                    id: "#PROG_MATA",
-                  },
-                  {
-                    text: "🔙 Kembali ke Menu Modul",
-                    id: "#BACK_TO_MODULE_MENU",
-                  },
-                ],
-              },
-              { quoted: message },
-            );
+            await sendTreatmentModuleMenu(targetIndex);
             return;
           }
 
@@ -2757,8 +3287,23 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
                 (t) => t.modul === "Injeksi",
               );
               if (oldIndex > -1) {
-                if (target.treatments[oldIndex].mediaPath) {
-                  await safeUnlink(target.treatments[oldIndex].mediaPath);
+                const oldTreatment = target.treatments[oldIndex];
+                if (Array.isArray(oldTreatment.videos)) {
+                  for (const vid of oldTreatment.videos) {
+                    if (vid.mediaPath) await safeUnlink(vid.mediaPath);
+                    if (vid.groupMsgKey && JID_GRUP_STAF) {
+                      try {
+                        await sock.sendMessage(JID_GRUP_STAF, {
+                          delete: vid.groupMsgKey,
+                        });
+                      } catch (e) {
+                        console.error(
+                          "Gagal menghapus pesan injeksi di grup:",
+                          e,
+                        );
+                      }
+                    }
+                  }
                 }
                 target.treatments.splice(oldIndex, 1);
               }
@@ -2952,7 +3497,6 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
             return;
           }
 
-          // SUB-HANDLER: KONDISI Pasien
           if (session.step === "WAITING_KONDISI_Pasien") {
             const targetIndex = session.data.targetIndex;
             let kond = "Aktif";
@@ -2988,34 +3532,28 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
             return;
           }
 
-          // SUB-HANDLER: GENERIC TEXT (Treatment Obat)
+          // SUB-HANDLER: TEKS GENERIK (Treatment Obat & Pesan Dokter)
           if (session.step === "WAITING_GENERIC_TEXT") {
             const targetIndex = session.data.targetIndex;
             const target = PasienPasienDB[targetIndex];
-            const modul = session.data.selectedModulName || "Treatment Obat";
+            const modulName = session.data.selectedModulName;
 
-            const oldTreatmentIndex = target.treatments.findIndex(
-              (t) => t.modul === modul,
+            const oldIndex = target.treatments.findIndex(
+              (t) => t.modul === modulName,
             );
-            if (oldTreatmentIndex > -1) {
-              const oldTreatment = target.treatments[oldTreatmentIndex];
-              if (oldTreatment.groupMsgKey) {
-                await sock.sendMessage(JID_GRUP_STAF, {
-                  delete: oldTreatment.groupMsgKey,
-                });
-              }
-              target.treatments.splice(oldTreatmentIndex, 1);
+            if (oldIndex > -1) {
+              target.treatments.splice(oldIndex, 1);
             }
 
             target.treatments.push({
-              modul,
+              modul: modulName,
               keterangan: cleanText,
             });
             saveData(PasienPasienDB);
 
             await sock.sendMessage(
               jid,
-              { text: `✅ *Data ${modul} Berhasil Dicatat!*` },
+              { text: `✅ *${modulName}* berhasil dicatat!` },
               { quoted: message },
             );
             await sendTreatmentModuleMenu(targetIndex);
@@ -3031,7 +3569,7 @@ Terima kasih telah mempercayakan perawatan hewan kesayangan Anda kepada kami! �
 
 // =========================================================================
 // EKSEKUSI APLIKASI
-// =========================================================================
+// // =========================================================================
 // console.log("🧪 Memulai pembersihan awal...");
 // clearMediaFolder();
 // resetDailyTreatments();

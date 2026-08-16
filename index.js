@@ -23,7 +23,7 @@ const myPhoneNumber = "6289523625059";
 const JID_GRUP_STAF = "120363411876684007@g.us";
 
 // Nomor-nomor yang diizinkan mengakses perintah bot (format tanpa '+')
-const ALLOWED_NUMBERS = ["98626089009193"];
+const ALLOWED_NUMBERS = ["98626089009193", "151629944877183"];
 
 const logger = pino({ level: "silent" });
 const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // Timeout otomatis 15 menit jika idle
@@ -246,20 +246,43 @@ async function sendPatientReportToOwner(sock, patient, ownerJid) {
   for (const treatment of patient.treatments || []) {
     if (treatment.mediaPath && fs.existsSync(treatment.mediaPath)) {
       let caption = "";
-      const targetIndex = session.data.targetIndex;
-      const target = PasienPasienDB[targetIndex];
-      const stage = session.data.progressTiming;
-      const bodyPart = session.data.selectedBodyPart;
-      const captionGrup = `${bodyPart} ${target.namaKucing} ${stage}`;
       if (treatment.modul === "PIP/PUP/Muntah") {
         if (treatment.subType === "pippup_khusus") {
           caption =
-            `${patient.namaKucing} ${treatment.penjelasanKhusus || "kondisi khusus"}`.trim();
+            `${patient.namaKucing} ${treatment.penjelasanKhusus || ""}`.trim();
         } else {
           caption = `${patient.namaKucing} ${treatment.subValue || ""}`.trim();
         }
-      } else {
-        caption = captionGrup;
+      }else if(treatment.modul === "Sisa Makanan"){
+        caption = `${treatment.modul || "Sisa Makanan"} ${patient.namaKucing}` || 'Sisa Makanan Kucing';
+      }
+       else if (treatment.modul === "Suhu Badan") {
+        caption = `Suhu ${patient.namaKucing}: ${treatment.keterangan}°C`;
+      } else if (treatment.modul === "Makan") {
+        caption = `${patient.namaKucing} ${treatment.keterangan || `${patient.namaKucing} makan sendiri`}`;
+      } else if (treatment.modul === "Minum") {
+        caption = `${patient.namaKucing} - ${treatment.keterangan || `${patient.namaKucing} minum sendiri`}`;
+      } else if (treatment.modul === "Treatment Obat") {
+        caption = `${patient.namaKucing} - ${treatment.keterangan || `Tidak ada treatment obat`}`;
+      } else if (treatment.modul === "Kondisi Pasien") {
+        caption =
+          caption = `${patient.namaKucing} - ${treatment.keterangan || `Aktif`}`;
+      } else if (
+        treatment.modul === "Dokumentasi Progress" &&
+        treatment.stage === "Sebelum dibersihkan"
+      ) {
+        caption = `${treatment.keterangan || ``}`;
+      } else if (
+        treatment.modul === "Dokumentasi Progress" &&
+        treatment.stage === "Sesudah dibersihkan"
+      ) {
+        caption = `${treatment.keterangan || ``}`;
+      } else if (treatment.modul === "Pesan Dokter") {
+        caption = `${treatment.keterangan || ``}`;
+      } else if (treatment.modul === "Infus") {
+        caption = `${treatment.keterangan || ``}`;
+      } else if(treatment.modul === "Injeksi"){
+        caption = `${treatment.keterangan || ``}`;
       }
 
       const mediaBuffer = await fs.promises.readFile(treatment.mediaPath);
@@ -341,6 +364,9 @@ async function sendPatientReportToOwner(sock, patient, ownerJid) {
   const catatan_injeksi =
     patient.treatments.find((t) => t.modul === "Injeksi")?.keterangan ||
     "Tidak ada injeksi";
+  const catatan_infus =
+    patient.treatments.find((t) => t.modul === "Infus")?.keterangan ||
+    "Tidak ada infus";
   const kondisi_Pasien =
     findTreatment("kondisi")?.keterangan || "Belum ada laporan";
   const pesanDokterText =
@@ -420,7 +446,10 @@ ${sesi.kode === "SORE" ? "4️⃣" : "5️⃣"} *Obat-obatan:*
 ${sesi.kode === "SORE" ? "5️⃣" : "6️⃣"} *Injeksi:*
 💉${catatan_injeksi}
 
-${sesi.kode === "SORE" ? "6️⃣" : "7️⃣"} *Status Kondisi:*
+${sesi.kode === "SORE" ? "6️⃣" : "7️⃣"} *Infus:*
+💧 ${catatan_infus}  
+
+${sesi.kode === "SORE" ? "8️⃣" : "9️⃣"} *Status Kondisi:*
 🏃‍♂️⚡ *${kondisi_Pasien}* 🔥
 
 ------------------------------------------
@@ -637,14 +666,11 @@ const connectToWhatsApp = async () => {
 
           const treatmentsList = PasienPasienDB[targetIndex].treatments;
           const treatmentIndex = treatmentsList.findIndex(
-            (t) =>
-              t.uploud === "success" &&
-              t.modul === "Dokumentasi Progress",
+            (t) => t.uploud === "success" && t.modul === "Dokumentasi Progress",
           );
           const data =
             PasienPasienDB[targetIndex].treatments[treatmentIndex] || "";
-          const ModulProgressPasien =
-            data.uploud === "success" ? "✅" : "";
+          const ModulProgressPasien = data.uploud === "success" ? "✅" : "";
 
           const hasPip = selected.treatments.some(
             (t) => t.modul === "PIP/PUP/Muntah" && t.subType === "pip",
@@ -677,7 +703,7 @@ const connectToWhatsApp = async () => {
           if (isPethotel == false) {
             if (sesi.kode === "PAGI") {
               moduleButtons.push({
-                text: `Suhu Badan ${isFilled("Suhu") ? "✅" : ""}`,
+                text: `Suhu Badan ${isFilled("Suhu Badan") ? "✅" : ""}`,
                 id: "#MODUL_SUHU",
               });
             }
@@ -685,6 +711,10 @@ const connectToWhatsApp = async () => {
               {
                 text: `Infus ${isFilled("Infus") ? "✅" : ""}`,
                 id: "#MODUL_INFUS",
+              },
+              {
+                text: `Injeksi ${isFilled("Injeksi") ? "✅" : ""}`, // <-- TAMBAHKAN TOMBOL INI
+                id: "#MODUL_INJEKSI",
               },
               {
                 text: `Treatment Obat ${isFilled("Treatment Obat") ? "✅" : ""}`,
@@ -1584,7 +1614,7 @@ const connectToWhatsApp = async () => {
             },
             { quoted: message },
           );
-
+          console.log(patient);
           // Mengirimkan preview media & rangkuman langsung ke JID pengirim (bot chat/grup staf)
           await sendPatientReportToOwner(sock, patient, jid);
 
@@ -1836,7 +1866,7 @@ const connectToWhatsApp = async () => {
               await sock.sendMessage(
                 jid,
                 {
-                  text: `🎉 *DATA PASIEN BERHASIL DISIMPAN!*\n\nID: ${dataPasienBaru.idPasien}\nOwner: ${dataPasienBaru.namaOwner}\nKucing: ${dataPasienBaru.namaKucing}\nStatus: ${dataPasienBaru.isInfectious ? "🔴 Infeksius" : "🟢 Non-Infeksius"}\n\n*Tubuh Yang Dipantau Progressnya:*\n${daftarKategoriText}`,
+                  text: `🎉 *DATA PASIEN BERHASIL DISIMPAN!*\n\nID: ${dataPasienBaru.idPasien}\nOwner: ${dataPasienBaru.namaOwner}\nKucing: ${dataPasienBaru.namaKucing}\nStatus: ${dataPasienBaru.isInfectious ? '🔴 Infeksius' : `${dataPasienBaru.isPetHotel ? '🏩Pet Hotel' : '🟢 Non-Infeksius'}`}\n\n*Tubuh Yang Dipantau Progressnya:*\n${daftarKategoriText}`,
                   buttons: [
                     { text: "➕ Tambah Pasien Lagi", id: "#Tambah_Pasien" },
                     { text: "💊 Ke Menu Treatment", id: "#TREATMENT" },
